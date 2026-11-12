@@ -115,6 +115,16 @@ In these cases, if you want to keep using your existing cache data, you can use 
 >>> session.cache.recreate_keys()
 ```
 
+Recreating keys also migrates the rest of the cache to match your current settings:
+
+* Response variants distinguished by `Vary` (for example different `Accept-Language` values) are
+  each kept under their own key
+* Redirect aliases (for example short links) are rebuilt, so they keep resolving from the cache
+  without re-requesting the origin, and stale aliases that point at missing responses are removed
+* Parameters added to `ignored_parameters` are redacted from previously cached responses
+* If several old responses now map to the same key, only the most recently cached one is kept
+* The operation is idempotent, so running it more than once leaves the cache unchanged
+
 ### Cache Key Functions
 If you want to implement your own request matching, you can provide a cache key function which will
 take a {py:class}`~requests.PreparedRequest` plus optional keyword args for

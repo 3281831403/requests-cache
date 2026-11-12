@@ -242,19 +242,75 @@ class BaseCache:
                 yield response
 
     def recreate_keys(self):
-        """Recreate cache keys for all previously cached responses"""
-        logger.debug('Recreating all cache keys')
-        old_keys = list(self.responses.keys())
+        """Recreate cache keys for all previously cached responses.
 
-        for old_cache_key in old_keys:
-            response = self.responses[old_cache_key]
+        This migrates an existing cache after request matching settings change (e.g. a new
+        ``key_fn``, ``match_headers``, or ``ignored_parameters``). In addition to recreating
+        response keys, this also:
+
+        * Redacts any newly configured ``ignored_parameters`` from previously cached responses
+        * Rebuilds redirect aliases so redirect entries (e.g. short links) keep working without
+          re-requesting the origin, and no stale redirect keys are left behind
+        * If multiple old responses map to the same new key, keeps only the most recently cached one
+        * Is idempotent: running it more than once produces the same cache state
+        """
+        logger.debug('Recreating all cache keys')
+        migrated_responses, migrated_redirects = self._recreate_cache_items()
+        self._replace_cache_items(migrated_responses, migrated_redirects)
+
+    def _recreate_cache_items(self):
+        """Compute migrated response and redirect mappings without modifying the cache.
+
+        Responses are snapshotted up front and migrated into a separate mapping, which avoids
+        in-place key collisions (a new key matching another entry's old key) and makes the
+        operation independent of storage iteration order.
+        """
+        old_responses = dict(self.responses.items())
+        migrated_responses: dict = {}
+
+        for response in old_responses.values():
             # Adjust empty request body for responses cached before 1.0
             if response.request.body == b'None':
                 response.request.body = b''
+            # Apply ignored_parameters to responses cached before those settings were configured,
+            # so sensitive values are redacted and the request matches the new key normalization
+            redact_response(response, self._settings.ignored_parameters)
             new_cache_key = self.create_key(response.request)
-            if new_cache_key != old_cache_key:
-                self.responses[new_cache_key] = response
-                del self.responses[old_cache_key]
+            response.cache_key = new_cache_key
+            # On collision, keep the most recently cached response; created_at is always populated
+            existing = migrated_responses.get(new_cache_key)
+            if existing is None or response.created_at >= existing.created_at:
+                migrated_responses[new_cache_key] = response
+
+        migrated_redirects = self._recreate_redirects(migrated_responses)
+        return migrated_responses, migrated_redirects
+
+    def _replace_cache_items(self, responses: dict, redirects: dict):
+        """Replace all response and redirect items with migrated mappings"""
+        self.responses.clear()
+        self.responses.update(responses)
+        self.redirects.clear()
+        self.redirects.update(redirects)
+
+    def _recreate_redirects(self, responses: dict) -> dict:
+        """Rebuild the redirects mapping for migrated responses.
+
+        New alias keys are generated from the requests in each response's redirect history, and
+        each alias points to the new key of its target response. This mirrors how redirect
+        aliases are created on write and ensures alias keys follow the current key settings, so
+        short links keep working without re-requesting the origin. Aliases that can't be rebuilt
+        (e.g. a response with no redirect history) are dropped rather than left dangling.
+        """
+        new_redirects: dict = {}
+        for new_cache_key, response in responses.items():
+            for redirect in response.history or []:
+                try:
+                    alias_key = self.create_key(redirect.request)
+                except Exception:
+                    logger.debug('Could not recreate redirect key; dropping alias', exc_info=True)
+                    continue
+                new_redirects[alias_key] = new_cache_key
+        return new_redirects
 
     # This is deprecated, but still appears in various examples online, so I'll postpone removing it
     # for awhile longer.

@@ -20,6 +20,8 @@ from tests.conftest import (
     MOCKED_URL_HTTPS,
     MOCKED_URL_JSON,
     MOCKED_URL_REDIRECT,
+    MOCKED_URL_REDIRECT_TARGET,
+    MOCKED_URL_VARY,
     START_DT,
     ignore_deprecation,
     mount_mock_adapter,
@@ -283,6 +285,129 @@ def test_recreate_keys__empty_response_body(mock_session):
     # Check that responses are returned from the cache correctly using the new key function
     for url in urls:
         assert mock_session.get(url).from_cache is True
+
+
+def test_recreate_keys__preserves_vary_variants(mock_session):
+    """All Vary variants must survive migration (the mocked page varies on ``Accept``)"""
+    headers_json = {'Accept': 'application/json'}
+    headers_html = {'Accept': 'text/html'}
+
+    # Populate two variants of the same Vary page. The second request misses the first
+    # variant's Vary check and is stored under a separate Vary-qualified key.
+    assert mock_session.get(MOCKED_URL_VARY, headers=headers_json).from_cache is False
+    assert mock_session.get(MOCKED_URL_VARY, headers=headers_html).from_cache is False
+    assert len(mock_session.cache.responses) == 2
+
+    # Change matching settings and migrate
+    mock_session.settings.match_headers = ['Accept']
+    mock_session.cache.recreate_keys()
+
+    # Neither variant may collapse into the other's key
+    variants = [r for r in mock_session.cache.responses.values() if r.url == MOCKED_URL_VARY]
+    assert len(variants) == 2
+    # Both variants must still be served from cache
+    assert mock_session.get(MOCKED_URL_VARY, headers=headers_json).from_cache is True
+    assert mock_session.get(MOCKED_URL_VARY, headers=headers_html).from_cache is True
+
+
+def test_recreate_keys__preserves_redirect_aliases(mock_session):
+    """Redirect entries (e.g. short links) must keep resolving without re-requesting origin"""
+    mock_session.get(MOCKED_URL_REDIRECT)
+    assert len(mock_session.cache.redirects) == 1
+
+    def new_key_fn(*args, **kwargs):
+        return create_key(*args, **kwargs) + '_suffix'
+
+    mock_session.settings.key_fn = new_key_fn
+    mock_session.cache.recreate_keys()
+
+    # The alias must still exist and point at an existing response
+    assert len(mock_session.cache.redirects) == 1
+    for alias_key, target_key in mock_session.cache.redirects.items():
+        assert target_key in mock_session.cache.responses
+        assert alias_key in mock_session.cache.redirects
+
+    # Following the short link must not hit the origin again
+    response = mock_session.get(MOCKED_URL_REDIRECT)
+    assert response.from_cache is True
+    assert response.url == MOCKED_URL_REDIRECT_TARGET
+    # No dangling redirect keys should accumulate after repeated migrations
+    mock_session.cache.recreate_keys()
+    assert len(mock_session.cache.redirects) == 1
+    assert all(v in mock_session.cache.responses for v in mock_session.cache.redirects.values())
+
+
+def test_recreate_keys__redacts_new_ignored_parameters(mock_session):
+    """Sensitive params added to ignored_parameters must be redacted from old records"""
+    base_url = f'{MOCKED_URL}/secret'
+    # 'secret_token' is not in the default ignored_parameters, so it is stored in plaintext
+    mock_session.mock_adapter.register_uri('GET', base_url, text='secret')
+    secret_url = f'{base_url}?secret_token=supersecret&keep=1'
+    mock_session.get(secret_url)
+    assert 'supersecret' in mock_session.get(secret_url).request.url
+
+    mock_session.settings.ignored_parameters = ['secret_token']
+    mock_session.cache.recreate_keys()
+
+    for response in mock_session.cache.responses.values():
+        assert 'supersecret' not in response.url
+        assert 'supersecret' not in response.request.url
+
+    # The redacted request must still resolve from cache under the new settings
+    assert mock_session.get(secret_url).from_cache is True
+
+
+def test_recreate_keys__collision_keeps_latest(mock_session):
+    """When old entries collide on the same new key, keep the most recently cached response"""
+    # Two different URLs that will collapse onto one key once their differing param is ignored
+    older_url = f'{MOCKED_URL}?variant=1'
+    newer_url = f'{MOCKED_URL}?variant=2'
+    mock_session.mock_adapter.register_uri('GET', older_url, text='older')
+    mock_session.mock_adapter.register_uri('GET', newer_url, text='newer')
+
+    with time_travel(START_DT):
+        mock_session.get(older_url)
+    with time_travel(START_DT + timedelta(seconds=10)):
+        mock_session.get(newer_url)
+    assert len(mock_session.cache.responses) == 2
+
+    mock_session.settings.ignored_parameters = ['variant']
+    mock_session.cache.recreate_keys()
+
+    assert len(mock_session.cache.responses) == 1
+    response = next(iter(mock_session.cache.responses.values()))
+    assert 'variant=2' not in response.url
+    assert response.content == b'newer'
+
+
+def test_recreate_keys__idempotent(mock_session):
+    """Running recreate_keys more than once must not change the resulting cache state"""
+    secret_base = f'{MOCKED_URL}/secret'
+    mock_session.mock_adapter.register_uri('GET', secret_base, text='secret')
+    mock_session.get(MOCKED_URL)
+    mock_session.get(MOCKED_URL_VARY, headers={'Accept': 'application/json'})
+    mock_session.get(MOCKED_URL_REDIRECT)
+    mock_session.get(f'{secret_base}?secret_token=supersecret')
+
+    mock_session.settings.match_headers = ['Accept']
+    mock_session.settings.ignored_parameters = ['secret_token']
+
+    def new_key_fn(*args, **kwargs):
+        return create_key(*args, **kwargs) + '_suffix'
+
+    mock_session.settings.key_fn = new_key_fn
+    mock_session.cache.recreate_keys()
+
+    responses_after_first = dict(mock_session.cache.responses)
+    redirects_after_first = dict(mock_session.cache.redirects)
+
+    mock_session.cache.recreate_keys()
+
+    assert set(mock_session.cache.responses.keys()) == set(responses_after_first.keys())
+    assert dict(mock_session.cache.redirects) == redirects_after_first
+    # Response contents are unchanged by the second run
+    for key, expected in responses_after_first.items():
+        assert mock_session.cache.responses[key].content == expected.content
 
 
 def test_reset_expiration__extend_expiration(mock_session):

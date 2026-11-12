@@ -167,10 +167,23 @@ class SQLiteCache(BaseCache):
                 valid=valid, expired=expired, invalid=invalid, older_than=older_than
             )
 
-    # A more efficient implementation of BaseCache.recreate_keys
+    # A more efficient implementation of BaseCache.recreate_keys, replacing all items in a
+    # single transaction per table instead of clearing and reinserting them
     def recreate_keys(self):
+        migrated_responses, migrated_redirects = self._recreate_cache_items()
+        self._replace_cache_items(migrated_responses, migrated_redirects)
+
+    def _replace_cache_items(self, responses: dict, redirects: dict):
+        """Replace all response and redirect items, atomically per table"""
+        old_response_keys = list(self.responses.keys())
+        old_redirect_keys = list(self.redirects.keys())
+
         with self.responses.bulk_commit():
-            super().recreate_keys()
+            self.responses.bulk_delete(old_response_keys)
+            self.responses.update(responses)
+        with self.redirects.bulk_commit():
+            self.redirects.bulk_delete(old_redirect_keys)
+            self.redirects.update(redirects)
 
     def sorted(
         self,

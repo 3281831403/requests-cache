@@ -1,6 +1,9 @@
 # History
 
 ## Unreleased
+* Fix `BaseCache.recreate_keys()` to preserve all `Vary` response variants, rebuild redirect
+aliases so short links don't re-request the origin, redact newly added `ignored_parameters`
+from old records, keep the most recently cached response on key collisions, and be idempotent
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches
