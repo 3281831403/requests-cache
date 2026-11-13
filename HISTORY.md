@@ -1,6 +1,8 @@
 # History
 
 ## Unreleased
+* Subtract the lifetime already consumed upstream (from `Age` or `Date` response headers) from `max-age`, so responses cached via a CDN don't restart the freshness clock when stored locally
+* On a 304 revalidation without freshness headers, renew the entry from the cached response's original `Cache-Control`/`Expires` directives instead of falling back to the session-level expiration (which could make the entry permanent)
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

@@ -289,7 +289,12 @@ class CacheMixin(MIXIN_BASE):
             )
             cached_response.cache_key = actions.cache_key
             if not actions.skip_write:
-                self.cache.save_response(cached_response, actions.cache_key, actions.expires)  # type: ignore[unreachable]
+                # Persist the revalidated response's own expiration (which may renew from the
+                # cached response's original Cache-Control/Expires headers) rather than the
+                # session-level actions.expires
+                self.cache.save_response(
+                    cached_response, actions.cache_key, cached_response.expires
+                )
             return cached_response
         else:
             logger.debug(f'Skipping cache write for URL: {request.url}')

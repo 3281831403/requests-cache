@@ -63,6 +63,24 @@ def get_expiration_seconds(expire_after: ExpirationTime) -> int:
     return ceil((expires - utcnow()).total_seconds()) if expires else NEVER_EXPIRE
 
 
+def get_http_age(age: Optional[int], date_header: Optional[str]) -> int:
+    """Estimate the time (in seconds) a response has already spent in intermediate caches
+    before it was received, based on its ``Age`` and/or ``Date`` headers.
+
+    Uses the ``Age`` header when available (RFC 9111, section 4.2.3), otherwise falls back
+    to the difference between the current time and the ``Date`` header. Invalid or missing
+    headers result in a consumed lifetime of zero, so older cache records without these
+    headers keep their previous behavior.
+    """
+    if age is not None:
+        return max(0, age)
+    if date_header:
+        date_dt = _parse_http_date(date_header)
+        if date_dt is not None:
+            return max(0, ceil((utcnow() - date_dt).total_seconds()))
+    return 0
+
+
 def get_url_expiration(
     url: Optional[str], urls_expire_after: Optional[ExpirationPatterns] = None
 ) -> ExpirationTime:

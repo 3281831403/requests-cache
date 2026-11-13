@@ -917,6 +917,238 @@ def test_has_content_changed__without_new_content(mock_session):
     assert revalidated_response.has_content_changed is False
 
 
+@skip_pypy
+def test_cache_control__age_header_reduces_local_freshness(mock_session):
+    """A response already aged on a CDN must expire based on max-age minus Age, instead of
+    restarting the freshness clock when written to the local cache"""
+    url = f'{MOCKED_URL}/cdn-aged'
+    mock_session.settings.cache_control = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='product page',
+        headers={'Cache-Control': 'max-age=7200', 'Age': '3600'},
+    )
+
+    with time_travel(START_DT):
+        response = mock_session.get(url)
+        assert response.from_cache is False
+
+    # Half the lifetime was already consumed upstream, so only ~3600s remain locally
+    with time_travel(START_DT + timedelta(seconds=3590)):
+        assert mock_session.get(url).from_cache is True
+    with time_travel(START_DT + timedelta(seconds=3610)):
+        assert mock_session.get(url).from_cache is False
+
+
+@skip_pypy
+def test_cache_control__date_header_reduces_local_freshness(mock_session):
+    """Without an Age header, the time elapsed since the Date header counts as consumed age"""
+    url = f'{MOCKED_URL}/cdn-dated'
+    mock_session.settings.cache_control = True
+    date_header = (START_DT - timedelta(seconds=3600)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='product page',
+        headers={'Cache-Control': 'max-age=7200', 'Date': date_header},
+    )
+
+    with time_travel(START_DT):
+        mock_session.get(url)
+
+    with time_travel(START_DT + timedelta(seconds=3590)):
+        assert mock_session.get(url).from_cache is True
+    with time_travel(START_DT + timedelta(seconds=3610)):
+        assert mock_session.get(url).from_cache is False
+
+
+@skip_pypy
+def test_cache_control__already_stale_age_makes_entry_expired(mock_session):
+    """Age >= max-age means the entry is stale on arrival; the next request must revalidate"""
+    url = f'{MOCKED_URL}/cdn-stale'
+    mock_session.settings.cache_control = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='product page',
+        headers={'Cache-Control': 'max-age=60', 'Age': '120', 'ETag': '"v1"'},
+    )
+
+    with time_travel(START_DT):
+        mock_session.get(url)
+        # Stale on arrival but has a validator: a conditional request is sent
+        mock_session.mock_adapter.register_uri('GET', url, status_code=304)
+        response = mock_session.get(url)
+        assert response.from_cache is True
+        assert response.revalidated is True
+        # A conditional request actually went to the origin
+        assert mock_session.mock_adapter.request_history[-1].headers.get('If-None-Match')
+
+
+@skip_pypy
+def test_304_without_cache_headers_renews_with_original_max_age(mock_session):
+    """Regression: a headerless 304 must renew TTL from the cached max-age, not become permanent.
+    After renewal the entry must expire again and trigger another revalidation."""
+    url = f'{MOCKED_URL}/304-no-headers'
+    mock_session.settings.cache_control = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='price list',
+        headers={'Cache-Control': 'max-age=60', 'ETag': '"v1"'},
+    )
+
+    with time_travel(START_DT):
+        mock_session.get(url)
+        mock_session.mock_adapter.register_uri(
+            'GET', url, status_code=304, headers={'ETag': '"v1"'}
+        )
+        # Still fresh: no origin request
+        assert mock_session.get(url).from_cache is True
+        assert len(mock_session.mock_adapter.request_history) == 1
+
+    with time_travel(START_DT + timedelta(seconds=61)):
+        # Expired: a 304 without caching headers renews using the original max-age
+        response = mock_session.get(url)
+        assert response.from_cache is True
+        assert response.revalidated is True
+        cached = mock_session.cache.get_response(response.cache_key)
+        assert cached.expires is not None
+        assert 0 < (cached.expires - utcnow()).total_seconds() <= 60
+
+    with time_travel(START_DT + timedelta(seconds=130)):
+        # The renewed entry expires again (at ~t=121) instead of staying permanently fresh
+        mock_session.get(url)
+        assert len(mock_session.mock_adapter.request_history) == 3
+
+    with time_travel(START_DT + timedelta(seconds=200)):
+        # And keeps revalidating on every subsequent expiry
+        mock_session.get(url)
+        assert len(mock_session.mock_adapter.request_history) == 4
+
+
+@skip_pypy
+def test_304_with_new_cache_control_takes_precedence(mock_session):
+    """Freshness directives sent on the 304 response override the cached ones"""
+    url = f'{MOCKED_URL}/304-new-cc'
+    mock_session.settings.cache_control = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='price list',
+        headers={'Cache-Control': 'max-age=60', 'ETag': '"v1"'},
+    )
+
+    with time_travel(START_DT):
+        mock_session.get(url)
+        mock_session.mock_adapter.register_uri(
+            'GET',
+            url,
+            status_code=304,
+            headers={'Cache-Control': 'max-age=10', 'ETag': '"v1"'},
+        )
+
+    with time_travel(START_DT + timedelta(seconds=61)):
+        response = mock_session.get(url)
+        assert response.revalidated is True
+        cached = mock_session.cache.get_response(response.cache_key)
+        assert 0 < (cached.expires - utcnow()).total_seconds() <= 10
+
+    with time_travel(START_DT + timedelta(seconds=80)):
+        # The new, shorter max-age governs: another revalidation happens
+        mock_session.get(url)
+        assert len(mock_session.mock_adapter.request_history) == 3
+
+
+@skip_pypy
+def test_304_without_freshness_headers_keeps_vary_and_ignored_parameters(mock_session):
+    """Headerless 304 renewal must not disturb Vary matching or ignored_parameters behavior"""
+    url = f'{MOCKED_URL}/304-vary'
+    mock_session.settings.cache_control = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='json variant',
+        headers={
+            'Cache-Control': 'max-age=60',
+            'ETag': '"v1"',
+            'Vary': 'Accept',
+        },
+    )
+
+    with time_travel(START_DT):
+        first = mock_session.get(url, headers={'Accept': 'application/json'})
+        assert first.from_cache is False
+        # Vary match: cache hit; an ignored auth header doesn't change the key
+        assert (
+            mock_session.get(
+                url,
+                headers={'Accept': 'application/json', 'Authorization': 'Bearer token'},
+            ).from_cache
+            is True
+        )
+        # Vary mismatch: cache miss, separate entry
+        assert mock_session.get(url, headers={'Accept': 'text/html'}).from_cache is False
+
+        mock_session.mock_adapter.register_uri(
+            'GET', url, status_code=304, headers={'ETag': '"v1"'}
+        )
+
+    with time_travel(START_DT + timedelta(seconds=61)):
+        # Revalidation still respects Vary and ignored_parameters
+        response = mock_session.get(
+            url,
+            headers={'Accept': 'application/json', 'Authorization': 'Bearer rotated-token'},
+        )
+        assert response.from_cache is True
+        assert response.revalidated is True
+        # The JSON variant remains a separate, still-fresh entry
+        assert mock_session.get(url, headers={'Accept': 'application/json'}).from_cache is True
+        # The HTML variant is an independent entry that now revalidates on its own
+        html_response = mock_session.get(url, headers={'Accept': 'text/html'})
+        assert html_response.revalidated is True
+        assert html_response.cache_key != response.cache_key
+
+
+def test_aged_response_roundtrip_through_sqlite(mock_session):
+    """Entries written with Age-adjusted TTL must survive SQLite serialization unchanged"""
+    url = f'{MOCKED_URL}/cdn-serialized'
+    mock_session.settings.cache_control = True
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        text='product page',
+        headers={'Cache-Control': 'max-age=7200', 'Age': '3600', 'ETag': '"v1"'},
+    )
+    response = mock_session.get(url)
+    stored = mock_session.cache.get_response(response.cache_key)
+    assert stored is not None
+    assert 3598 <= (stored.expires - utcnow()).total_seconds() <= 3600
+    # Re-reading through the storage layer exercises deserialization
+    assert mock_session.get(url).from_cache is True
+
+
+def test_old_cached_record_without_age_headers_does_not_raise(mock_session):
+    """A record created by an older cache version (no Age/Date headers) must load and revalidate
+    without errors"""
+    url = f'{MOCKED_URL}/legacy-record'
+    mock_session.settings.cache_control = True
+    mock_session.mock_adapter.register_uri('GET', url, text='legacy', headers={'ETag': '"old"'})
+    mock_session.get(url)
+
+    # Simulate a legacy record: strip any Age/Date (there are none) and set no explicit expiry
+    key = mock_session.cache.create_key(Request('GET', url).prepare())
+    cached = mock_session.cache.get_response(key)
+    cached.expires = utcnow() - timedelta(seconds=1)
+    mock_session.cache.responses[key] = cached
+
+    mock_session.mock_adapter.register_uri('GET', url, status_code=304, headers={'ETag': '"old"'})
+    response = mock_session.get(url)
+    assert response.from_cache is True
+    assert response.status_code == 200
+
+
 @pytest.mark.parametrize(
     'refreshed_content, expected_change',
     [('original content', False), ('updated content', True)],

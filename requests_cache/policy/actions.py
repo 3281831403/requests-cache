@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from logging import DEBUG, getLogger
+from math import ceil
 from typing import TYPE_CHECKING, Dict, List, Mapping, MutableMapping, Optional, Union
 
 from attrs import define, field
@@ -18,6 +19,7 @@ from . import (
     KeyCallback,
     get_expiration_datetime,
     get_expiration_seconds,
+    get_http_age,
     get_url_expiration,
     utcnow,
 )
@@ -279,19 +281,21 @@ class CacheActions(RichMixin):
         """After revalidation, update the cached response's expiration and headers"""
         logger.debug(f'Response for URL {response.request.url} has not been modified')
 
+        new_expires = self._get_revalidated_expires(response, cached_response)
+
         # Skip updating the cached response if expiration and headers are unchanged
         # OR if session/request settings skip it.
         # Ignore validators missing from new response, since they may be omitted
         headers_changed = any(
             cached_response.headers.get(k) != v for k, v in response.headers.items()
         )
-        expiration_changed = self.expires != cached_response.expires
+        expiration_changed = new_expires != cached_response.expires
         permanent_skip = (
             self._settings.read_only or self._settings.disabled or self._directives.no_store
         )
         self.skip_write = permanent_skip or not (expiration_changed or headers_changed)
 
-        cached_response.expires = self.expires
+        cached_response.expires = new_expires
 
         # Update headers;
         # Account for Transfer-Encoding in original response and Content-Length in 304 response
@@ -305,6 +309,46 @@ class CacheActions(RichMixin):
         cached_response.revalidated = True
         cached_response.has_content_changed = False
         return cached_response
+
+    def _get_revalidated_expires(
+        self, response: Response, cached_response: 'CachedResponse'
+    ) -> Optional[datetime]:
+        """Determine the expiration of a cached response after a 304 (Not Modified) revalidation.
+
+        Per RFC 9111, section 4.3.4, freshness information sent by the 304 response takes
+        precedence. If the 304 response doesn't provide any, fall back to the directives stored
+        on the cached response so its original ``max-age`` is used to renew the entry, instead of
+        treating it as permanently fresh. Records without either (e.g. from older cache versions)
+        fall back to the session/request-level expiration without raising an error.
+        """
+        directives = CacheDirectives.from_headers(response.headers)
+        if directives.immutable:
+            return get_expiration_datetime(NEVER_EXPIRE)
+        has_freshness_info = directives.max_age is not None or directives.expires is not None
+        if not has_freshness_info and self._settings.cache_control:
+            lifetime = self._get_cached_freshness_lifetime(cached_response)
+            if lifetime is not None:
+                return get_expiration_datetime(lifetime)
+        return self.expires
+
+    @staticmethod
+    def _get_cached_freshness_lifetime(
+        cached_response: 'CachedResponse',
+    ) -> Optional[int]:
+        """Get the remaining freshness lifetime (in seconds) implied by a cached response's own
+        Cache-Control/Expires headers. Returns ``None`` if the record doesn't specify any.
+        """
+        directives = CacheDirectives.from_headers(cached_response.headers)
+        if directives.max_age is not None:
+            return max(0, directives.max_age)
+        if directives.expires:
+            expires_dt = _validate_expires_header(directives.expires)
+            if expires_dt == EXPIRE_IMMEDIATELY:
+                return 0
+            expires_dt = get_expiration_datetime(expires_dt, ignore_invalid_httpdate=True)
+            if expires_dt is not None:
+                return max(0, ceil((expires_dt - utcnow()).total_seconds()))
+        return None
 
     def _update_from_cached_response_headers(self, cached_response: 'CachedResponse'):
         """Recover stale-if-error and stale-while-revalidate directives from a cached response"""
@@ -323,11 +367,27 @@ class CacheActions(RichMixin):
             self.expire_after = NEVER_EXPIRE
         else:
             self.expire_after = coalesce(
-                directives.max_age,
+                self._get_remaining_freshness(directives),
                 _validate_expires_header(directives.expires),
                 self.expire_after,
             )
         self.skip_write = self.skip_write or directives.no_store
+
+    @staticmethod
+    def _get_remaining_freshness(directives: CacheDirectives) -> Optional[int]:
+        """Get the remaining freshness lifetime from a response's Cache-Control directives.
+
+        If the response carries an ``Age`` header (e.g. after passing through a CDN) or a
+        ``Date`` header, subtract the lifetime already consumed upstream so the local cache
+        doesn't restart the ``max-age`` clock from the moment it was stored (RFC 9111,
+        section 4.2.3). Returns the remaining lifetime in seconds (never negative), or
+        ``None`` if no ``max-age`` directive is present.
+        """
+        if directives.max_age is None:
+            return None
+        consumed = get_http_age(directives.age, directives.date)
+        logger.debug(f'Subtracting {consumed}s of already-consumed freshness from max-age')
+        return max(0, directives.max_age - consumed)
 
     def _update_validation_headers(self, cached_response: 'CachedResponse'):
         """If needed, get validation headers based on a cached response. Revalidation may be

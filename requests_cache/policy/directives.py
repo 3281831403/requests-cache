@@ -29,6 +29,8 @@ class CacheDirectives(RichMixin):
     stale_while_revalidate: int = field(default=None, converter=try_int)
     etag: str = field(default=None)
     last_modified: str = field(default=None)
+    age: Optional[int] = field(default=None, converter=try_int)
+    date: str = field(default=None)
 
     @classmethod
     def from_headers(cls, headers: HeaderDict):
@@ -40,10 +42,12 @@ class CacheDirectives(RichMixin):
             cls.__init__, {k.replace('-', '_'): v for k, v in kv_directives.items()}
         )
 
-        kwargs['actual_no_cache'] = headers.pop('X-ACTUAL-NO-CACHE', False)
+        kwargs['actual_no_cache'] = headers.get('X-ACTUAL-NO-CACHE', False)
         kwargs['expires'] = headers.get('Expires')
         kwargs['etag'] = headers.get('ETag')
         kwargs['last_modified'] = headers.get('Last-Modified')
+        kwargs['age'] = headers.get('Age')
+        kwargs['date'] = headers.get('Date')
         return cls(**kwargs)
 
     def get_expire_offset(self) -> timedelta:

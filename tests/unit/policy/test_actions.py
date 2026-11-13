@@ -666,3 +666,164 @@ def test_ignored_headers(directive):
     assert actions.expire_after == 1
     assert actions.skip_read is False
     assert actions.skip_write is False
+
+
+@pytest.mark.parametrize(
+    'response_headers, expected_expire_after',
+    [
+        # No Age/Date: max-age is used unchanged
+        ({'Cache-Control': 'max-age=7200'}, 7200),
+        # Age subtracts the lifetime already consumed on an upstream cache/CDN
+        ({'Cache-Control': 'max-age=7200', 'Age': '3600'}, 3600),
+        # Consumed lifetime greater than max-age: already stale, never negative
+        ({'Cache-Control': 'max-age=60', 'Age': '120'}, 0),
+        # A non-numeric Age header is ignored instead of raising
+        ({'Cache-Control': 'max-age=60', 'Age': 'unknown'}, 60),
+    ],
+)
+def test_update_from_response__age_header(response_headers, expected_expire_after):
+    """The Age header must reduce the locally-assigned freshness lifetime (RFC 9111)"""
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    actions.update_from_response(create_mock_response(headers=response_headers))
+
+    assert actions.expire_after == expected_expire_after
+
+
+def test_update_from_response__date_header():
+    """Without an Age header, time since the Date header counts as consumed lifetime"""
+    date_header = (utcnow() - timedelta(seconds=300)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    actions.update_from_response(
+        create_mock_response(headers={'Cache-Control': 'max-age=600', 'Date': date_header})
+    )
+
+    # 600 - ~300 consumed; allow a small margin for elapsed test time
+    assert 298 <= actions.expire_after <= 300
+
+
+def test_update_from_response__age_takes_precedence_over_date():
+    """Age header is authoritative when both Age and Date are present"""
+    date_header = (utcnow() - timedelta(seconds=300)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    actions.update_from_response(
+        create_mock_response(
+            headers={'Cache-Control': 'max-age=7200', 'Age': '3600', 'Date': date_header}
+        )
+    )
+
+    assert actions.expire_after == 3600
+
+
+def test_update_from_response__invalid_date_header():
+    """An unparseable Date header must not raise; max-age applies in full"""
+    actions = CacheActions.from_request('key', BASIC_REQUEST, CacheSettings(cache_control=True))
+    actions.update_from_response(
+        create_mock_response(headers={'Cache-Control': 'max-age=60', 'Date': 'not-a-valid-date'})
+    )
+
+    assert actions.expire_after == 60
+
+
+def _revalidate(cached_headers, revalidation_headers, cache_control=True, expire_after=None):
+    """Run the same sequence CachedSession performs for a 304 revalidation"""
+    actions = CacheActions.from_request(
+        'key',
+        BASIC_REQUEST,
+        CacheSettings(cache_control=cache_control, expire_after=expire_after),
+    )
+    initial_response = create_mock_response(headers=cached_headers)
+    actions.update_from_response(initial_response)
+    cached_response = CachedResponse.from_response(initial_response, expires=actions.expires)
+
+    new_response = create_mock_response(status_code=304, headers=revalidation_headers)
+    # In CachedSession._send_and_cache(), the 304 response is processed before revalidation
+    actions.update_from_response(new_response)
+    return actions, actions.update_revalidated_response(new_response, cached_response)
+
+
+def test_revalidate__304_without_cache_headers_renews_original_max_age():
+    """A 304 without freshness headers must renew using the cached max-age, not expire
+    immediately or become permanent"""
+    _, cached_response = _revalidate(
+        cached_headers={'Cache-Control': 'max-age=7200', 'ETag': ETAG},
+        revalidation_headers={'ETag': ETAG},
+    )
+
+    assert cached_response.expires is not None
+    assert 7198 <= (cached_response.expires - utcnow()).total_seconds() <= 7200
+
+
+def test_revalidate__304_with_new_cache_control_takes_precedence():
+    """Freshness headers on the 304 response take precedence over the cached ones"""
+    _, cached_response = _revalidate(
+        cached_headers={'Cache-Control': 'max-age=7200', 'ETag': ETAG},
+        revalidation_headers={'Cache-Control': 'max-age=60', 'ETag': ETAG},
+    )
+
+    assert cached_response.expires is not None
+    assert 58 <= (cached_response.expires - utcnow()).total_seconds() <= 60
+
+
+def test_revalidate__304_without_any_freshness_info_falls_back_to_session_setting():
+    """Old cache records without Cache-Control/Expires don't raise; session setting is used"""
+    actions, cached_response = _revalidate(
+        cached_headers={'ETag': ETAG},
+        revalidation_headers={'ETag': ETAG},
+        expire_after=30,
+    )
+
+    # Both are computed independently from utcnow(), so compare with a small tolerance
+    assert abs((cached_response.expires - actions.expires).total_seconds()) <= 1
+    assert cached_response.expires is not None
+    assert 28 <= (cached_response.expires - utcnow()).total_seconds() <= 30
+
+
+def test_revalidate__304_without_freshness_info_and_never_expire_session():
+    """The pre-fix behavior made headerless 304s permanent even with max-age on the cache entry;
+    here the cached max-age must win over a session-level 'never expire' default"""
+    _, cached_response = _revalidate(
+        cached_headers={'Cache-Control': 'max-age=7200', 'ETag': ETAG},
+        revalidation_headers={'ETag': ETAG},
+        expire_after=-1,
+    )
+
+    assert cached_response.expires is not None
+    assert (cached_response.expires - utcnow()).total_seconds() <= 7200
+
+
+def test_revalidate__304_uses_cached_expires_header_without_cache_control():
+    """With no max-age anywhere, an Expires header on the cached response still bounds TTL"""
+    expires_header = (utcnow() + timedelta(seconds=120)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+    _, cached_response = _revalidate(
+        cached_headers={'Expires': expires_header, 'ETag': ETAG},
+        revalidation_headers={'ETag': ETAG},
+    )
+
+    assert cached_response.expires is not None
+    assert 118 <= (cached_response.expires - utcnow()).total_seconds() <= 120
+
+
+def test_revalidate__304_with_immutable_makes_entry_permanent():
+    """An `immutable` directive on the 304 response means the entry never expires, even
+    without an explicit max-age"""
+    _, cached_response = _revalidate(
+        cached_headers={'Cache-Control': 'max-age=60', 'ETag': ETAG},
+        revalidation_headers={'Cache-Control': 'immutable', 'ETag': ETAG},
+    )
+
+    assert cached_response.expires is None
+    assert cached_response.is_expired is False
+
+
+def test_revalidate__cache_control_disabled_keeps_legacy_behavior():
+    """When cache_control is off, response headers never drive expiration"""
+    actions, cached_response = _revalidate(
+        cached_headers={'Cache-Control': 'max-age=7200', 'ETag': ETAG},
+        revalidation_headers={'ETag': ETAG},
+        cache_control=False,
+        expire_after=45,
+    )
+
+    assert abs((cached_response.expires - actions.expires).total_seconds()) <= 1
+    assert cached_response.expires is not None
+    assert 43 <= (cached_response.expires - utcnow()).total_seconds() <= 45

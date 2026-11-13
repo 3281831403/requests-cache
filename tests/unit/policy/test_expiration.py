@@ -8,6 +8,7 @@ from requests_cache.policy.expiration import (
     DO_NOT_CACHE,
     EXPIRE_IMMEDIATELY,
     get_expiration_datetime,
+    get_http_age,
     get_url_expiration,
     utcnow,
 )
@@ -131,3 +132,41 @@ def test_set_request_headers__do_not_cache():
     )
     assert 'X-ACTUAL-NO-CACHE' in headers
     assert 'Cache-Control' not in headers
+
+
+def test_get_http_age__from_age_header():
+    assert get_http_age(3600, None) == 3600
+
+
+def test_get_http_age__age_header_takes_precedence_over_date():
+    """The Age header is authoritative when both headers are present (RFC 9111)"""
+    date_header = (utcnow() - timedelta(seconds=10)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+    assert get_http_age(3600, date_header) == 3600
+
+
+def test_get_http_age__from_date_header():
+    date_header = (utcnow() - timedelta(seconds=300)).strftime('%a, %d %b %Y %H:%M:%S GMT')
+    age = get_http_age(None, date_header)
+    assert 300 <= age <= 302
+
+
+def test_get_http_age__missing_headers():
+    assert get_http_age(None, None) == 0
+
+
+def test_get_http_age__invalid_date_header():
+    """Old/corrupt records with an unparseable Date must not raise"""
+    assert get_http_age(None, 'not-a-date') == 0
+
+
+def test_get_http_age__invalid_age_header():
+    """A non-numeric Age header is parsed as None and must not raise downstream"""
+    from requests_cache.policy.directives import CacheDirectives
+
+    directives = CacheDirectives.from_headers({'Age': 'not-a-number'})
+    assert directives.age is None
+    assert get_http_age(directives.age, None) == 0
+
+
+def test_get_http_age__negative_age_clamped():
+    assert get_http_age(-50, None) == 0
